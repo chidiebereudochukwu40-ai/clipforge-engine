@@ -1,12 +1,13 @@
 import os
 import json
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 import requests
 import modal
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("ffmpeg", "git")
+    .apt_install("ffmpeg", "git", "nodejs")
     .pip_install(
         "yt-dlp",
         "faster-whisper",
@@ -29,6 +30,8 @@ def format_srt_time(seconds: float) -> str:
 
 
 @app.function(
+    cpu=4.0,
+    memory=4096,
     timeout=1800,
     secrets=[modal.Secret.from_name("clipforge-secrets")],
 )
@@ -41,22 +44,24 @@ def process_stream_job(job_id: str, source_url: str, caption_style: str, callbac
     os.makedirs(work_dir, exist_ok=True)
     video_path = f"{work_dir}/source.mp4"
 
-    # 1. Download Live Stream or VOD (captures up to first 60 mins cleanly)
+    # 1. Fast 720p download with Node.js + mobile/web client support
     subprocess.run(
         [
             "yt-dlp",
-            "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
+            "--extractor-args", "youtube:player_client=android,web",
             "--live-from-start",
-            "--download-sections", "*00:00:00-01:00:00",
+            "--download-sections", "*00:00:00-00:45:00",
+            "--merge-output-format", "mp4",
             "-o", video_path,
             source_url,
         ],
         check=True,
     )
 
-    # 2. Word-level transcription on free CPU
-    model = WhisperModel("tiny", device="cpu", compute_type="int8")
-    segments, _ = model.transcribe(video_path, word_timestamps=True)
+    # 2. Fast 4-thread CPU transcription
+    model = WhisperModel("tiny", device="cpu", compute_type="int8", cpu_threads=4)
+    segments, _ = model.transcribe(video_path, word_timestamps=True, beam_size=1)
 
     transcript_lines = []
     all_words = []
@@ -68,7 +73,7 @@ def process_stream_job(job_id: str, source_url: str, caption_style: str, callbac
 
     full_transcript = "\n".join(transcript_lines)
 
-    # 3. Pick the Top 10 Viral Moments using Free Gemini API
+    # 3. Pick Top 10 Viral Moments with Free Gemini API
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
     prompt = f"""
     You are a viral short-form video editor for top streamers.
@@ -85,25 +90,22 @@ def process_stream_job(job_id: str, source_url: str, caption_style: str, callbac
     )
     clips_meta = json.loads(response.text)[:10]
 
-    # 4. Caption Colors
     color_map = {
         "Bold Yellow": "&H0000FFFF",
         "Neon Green": "&H0000FF00",
         "Clean White": "&H00FFFFFF",
     }
     primary_color = color_map.get(caption_style, "&H0000FFFF")
-
-    # 5. Connect to Free Supabase Storage
     supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
-    uploaded_urls = []
 
-    # 6. Crop to 9:16 Vertical & Burn Dynamic Captions
-    for idx, clip in enumerate(clips_meta):
+    # 4. Cut, caption & upload all 10 clips IN PARALLEL (4 workers at once)
+    def render_and_upload(item):
+        idx, clip = item
         start_t = float(clip["start"])
         end_t = float(clip["end"])
         duration = end_t - start_t
         if duration < 10:
-            continue
+            return None
 
         srt_path = f"{work_dir}/clip_{idx}.srt"
         out_path = f"{work_dir}/clip_{idx}.mp4"
@@ -114,7 +116,7 @@ def process_stream_job(job_id: str, source_url: str, caption_style: str, callbac
             sub_idx = 1
             for i in range(0, len(clip_words), chunk_size):
                 chunk = clip_words[i : i + chunk_size]
-                c_start = chunk[0]["start"] - start_t
+                c_start = chunk["start"] - start_t
                 c_end = chunk[-1]["end"] - start_t
                 text = " ".join(w["word"].upper() for w in chunk)
                 f.write(f"{sub_idx}\n{format_srt_time(c_start)} --> {format_srt_time(c_end)}\n{text}\n\n")
@@ -124,7 +126,7 @@ def process_stream_job(job_id: str, source_url: str, caption_style: str, callbac
             f"Fontname=Arial,Fontsize=18,Bold=1,PrimaryColour={primary_color},"
             "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=65"
         )
-        vf_filter = f"crop=ih*9/16:ih,scale=1080:1920,subtitles={srt_path}:force_style='{style_str}'"
+        vf_filter = f"crop=ih*9/16:ih,scale=720:1280,subtitles={srt_path}:force_style='{style_str}'"
 
         subprocess.run(
             [
@@ -133,7 +135,7 @@ def process_stream_job(job_id: str, source_url: str, caption_style: str, callbac
                 "-t", str(duration),
                 "-i", video_path,
                 "-vf", vf_filter,
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
                 "-c:a", "aac", "-b:a", "128k",
                 out_path,
             ],
@@ -148,10 +150,14 @@ def process_stream_job(job_id: str, source_url: str, caption_style: str, callbac
                 file_options={"content-type": "video/mp4"},
             )
 
-        public_url = supabase.storage.from_("clipforge-videos").get_public_url(remote_path)
-        uploaded_urls.append(public_url)
+        return supabase.storage.from_("clipforge-videos").get_public_url(remote_path)
 
-    # 7. Send all 10 finished 9:16 clips back to Base44
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(render_and_upload, enumerate(clips_meta)))
+
+    uploaded_urls = [u for u in results if u]
+
+    # 5. Send all 10 finished 9:16 clips back to Base44
     requests.post(
         callback_url,
         json={
@@ -173,4 +179,4 @@ def trigger_clip_webhook(payload: dict):
         callback_url=payload["callback_url"],
     )
     return {"status": "accepted", "job_id": payload["job_id"]}
-    
+        
