@@ -29,7 +29,6 @@ def format_srt_time(seconds: float) -> str:
 
 
 @app.function(
-    gpu="T4",
     timeout=1800,
     secrets=[modal.Secret.from_name("clipforge-secrets")],
 )
@@ -55,8 +54,8 @@ def process_stream_job(job_id: str, source_url: str, caption_style: str, callbac
         check=True,
     )
 
-    # 2. Word-level transcription just like the Skool Whisper setup
-    model = WhisperModel("base", device="cuda", compute_type="float16")
+    # 2. Word-level transcription on free CPU
+    model = WhisperModel("tiny", device="cpu", compute_type="int8")
     segments, _ = model.transcribe(video_path, word_timestamps=True)
 
     transcript_lines = []
@@ -174,4 +173,4 @@ def trigger_clip_webhook(payload: dict):
         callback_url=payload["callback_url"],
     )
     return {"status": "accepted", "job_id": payload["job_id"]}
-  
+    
